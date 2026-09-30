@@ -1,0 +1,226 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; background: #0f172a; overflow: hidden; font: 12px/1.35 system-ui, Segoe UI, sans-serif; }
+  #wrap { position: relative; }
+  canvas { display: block; cursor: crosshair; border-radius: 10px; }
+  .ov { position: absolute; background: rgba(15,23,42,.88); color: #94a3b8; border-radius: 6px; pointer-events: none; }
+  #hud { left: 8px; bottom: 8px; padding: 3px 9px; font-size: 11px; color: #cbd5e1; }
+  #help { right: 8px; bottom: 8px; padding: 4px 9px; font-size: 10.5px; line-height: 1.5; text-align: right; }
+  #help b { color: #e2e8f0; }
+  #tb { position: absolute; left: 8px; top: 8px; display: flex; gap: 4px; align-items: center;
+        background: rgba(15,23,42,.9); border: 1px solid #26344f; border-radius: 8px; padding: 3px; }
+  #tb button { background: transparent; color: #94a3b8; border: 0; border-radius: 5px; padding: 3px 10px; font: inherit; font-weight: 600; cursor: pointer; }
+  #tb button.on { background: #38bdf8; color: #04121f; }
+  #tb button:disabled { opacity: .35; cursor: default; }
+  #tb .sp { width: 1px; height: 16px; background: #26344f; margin: 0 2px; }
+  #tb button.act { color: #e2e8f0; border: 1px solid #26344f; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c"></canvas>
+  <div id="tb">
+    <button id="mLine" class="on" title="One drag = one section line">Line</button>
+    <button id="mPoly" title="Drag several segments, then finish">Polyline</button>
+    <span class="sp"></span>
+    <button id="bFinish" class="act" disabled title="Finish polyline (Enter / double-click)">Finish ⏎</button>
+    <button id="bUndo" class="act" disabled title="Remove last vertex (Backspace)">Undo</button>
+    <button id="bFit" class="act" title="Reset view (F)">Fit</button>
+  </div>
+  <div id="help" class="ov"></div>
+  <div id="hud" class="ov">X –, Y –</div>
+</div>
+<script>
+(function () {
+  const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+  const hud = document.getElementById("hud"), help = document.getElementById("help");
+  const base = document.createElement("canvas"), bctx = base.getContext("2d");   // cached terrain layer
+  const $ = id => document.getElementById(id);
+
+  let A = null, sig = null;
+  let W = 800, H = 620, dpr = window.devicePixelRatio || 1;
+  let k = 1, panx = 0, pany = 0, cx = 0, cy = 0, fitted = false;
+  let mode = "line";        // "line" | "poly"
+  let poly = [];            // committed polyline vertices (world coords)
+  let drag = null;          // {from:[x,y], to:[x,y]} rubber band while the button is held
+  let panning = null;
+
+  // ---- Streamlit protocol ---------------------------------------------------
+  function send(type, data) { window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data), "*"); }
+  window.addEventListener("message", function (e) {
+    if (!e.data || e.data.type !== "streamlit:render") return;
+    A = e.data.args; H = A.height || 620;
+    if (sig !== A.sig) { fitted = false; sig = A.sig; }
+    resize();
+  });
+  send("streamlit:componentReady", { apiVersion: 1 });
+
+  // ---- helpers ----------------------------------------------------------------
+  const STOPS = [[0,[43,108,176]],[0.15,[47,133,90]],[0.4,[163,191,94]],[0.6,[230,214,144]],[0.8,[160,120,90]],[1,[247,250,252]]];
+  function color(t) {
+    t = Math.max(0, Math.min(1, t));
+    for (let i = 1; i < STOPS.length; i++) if (t <= STOPS[i][0]) {
+      const a = STOPS[i-1], b = STOPS[i], f = (t - a[0]) / (b[0] - a[0]);
+      return "rgb(" + [0,1,2].map(j => Math.round(a[1][j] + f * (b[1][j] - a[1][j]))).join(",") + ")";
+    }
+    return "rgb(247,250,252)";
+  }
+  const w2s = (x, y) => [ (x - cx) * k + W / 2 + panx, H / 2 - (y - cy) * k + pany ];
+  const s2w = (sx, sy) => [ (sx - W / 2 - panx) / k + cx, (H / 2 + pany - sy) / k + cy ];
+
+  function fit() {
+    let x0 = 1e18, x1 = -1e18, y0 = 1e18, y1 = -1e18;
+    for (const p of A.pts) { x0 = Math.min(x0,p[0]); x1 = Math.max(x1,p[0]); y0 = Math.min(y0,p[1]); y1 = Math.max(y1,p[1]); }
+    cx = (x0+x1)/2; cy = (y0+y1)/2;
+    const m = 44;
+    k = Math.min((W - 2*m) / Math.max(x1-x0, 1e-9), (H - 2*m) / Math.max(y1-y0, 1e-9));
+    panx = 0; pany = 0; fitted = true;
+  }
+  function resize() {
+    W = Math.max(300, Math.floor(document.documentElement.clientWidth || window.innerWidth));
+    cv.width = W * dpr; cv.height = H * dpr; cv.style.width = W + "px"; cv.style.height = H + "px";
+    base.width = cv.width; base.height = cv.height;
+    send("streamlit:setFrameHeight", { height: H });
+    if (A && !fitted) fit();
+    drawBase(); draw(); ui();
+  }
+  window.addEventListener("resize", resize);
+
+  // ---- rendering ----------------------------------------------------------------
+  function drawBase() {
+    if (!A) return;
+    bctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    bctx.fillStyle = "#0f172a"; bctx.fillRect(0, 0, W, H);
+    const P = A.pts, T = A.tris, zmin = A.zmin, zr = Math.max(A.zmax - A.zmin, 1e-9);
+    bctx.lineJoin = "round"; bctx.lineWidth = 0.8;
+    const S = P.map(p => w2s(p[0], p[1]));
+    for (const t of T) {
+      const a = S[t[0]], b = S[t[1]], c = S[t[2]];
+      bctx.beginPath(); bctx.moveTo(a[0], a[1]); bctx.lineTo(b[0], b[1]); bctx.lineTo(c[0], c[1]); bctx.closePath();
+      const col = color(((P[t[0]][2] + P[t[1]][2] + P[t[2]][2]) / 3 - zmin) / zr);
+      bctx.fillStyle = col; bctx.strokeStyle = col; bctx.fill(); bctx.stroke();
+    }
+    bctx.strokeStyle = "rgba(15,23,42,.35)"; bctx.lineWidth = 0.6;
+    for (const t of T) {
+      const a = S[t[0]], b = S[t[1]], c = S[t[2]];
+      bctx.beginPath(); bctx.moveTo(a[0], a[1]); bctx.lineTo(b[0], b[1]); bctx.lineTo(c[0], c[1]); bctx.closePath(); bctx.stroke();
+    }
+    if (P.length <= 3000) {
+      bctx.fillStyle = "rgba(15,23,42,.8)";
+      for (const s of S) { bctx.beginPath(); bctx.arc(s[0], s[1], 1.8, 0, 6.2832); bctx.fill(); }
+    }
+  }
+
+  function label(text, x, y, col) {
+    ctx.font = "bold 12px system-ui"; ctx.textBaseline = "middle";
+    const w = ctx.measureText(text).width + 10;
+    ctx.fillStyle = "rgba(15,23,42,.88)"; ctx.fillRect(x - 5, y - 9, w, 18);
+    ctx.fillStyle = col; ctx.fillText(text, x, y);
+  }
+  function path(pts, col, width, name, dashed) {
+    const S = pts.map(p => w2s(p[0], p[1]));
+    ctx.strokeStyle = col; ctx.lineWidth = width; ctx.setLineDash(dashed ? [8, 5] : []); ctx.lineJoin = "round";
+    ctx.beginPath(); S.forEach((s, i) => i ? ctx.lineTo(s[0], s[1]) : ctx.moveTo(s[0], s[1])); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = col;
+    S.forEach((s, i) => { ctx.beginPath(); ctx.arc(s[0], s[1], (i === 0 || i === S.length-1) ? 5 : 3.5, 0, 6.2832); ctx.fill(); });
+    if (name) { label(name, S[0][0] + 9, S[0][1] - 14, col); label(name + "'", S[S.length-1][0] + 9, S[S.length-1][1] - 14, col); }
+  }
+  function segLabel(a, b) {
+    const dx = b[0]-a[0], dy = b[1]-a[1], L = Math.hypot(dx, dy), ang = (Math.atan2(dy, dx) * 180 / Math.PI + 360) % 360;
+    const m = w2s((a[0]+b[0])/2, (a[1]+b[1])/2);
+    label(L.toFixed(2) + " " + A.unit + "  ∠" + ang.toFixed(1) + "°", m[0] + 10, m[1] + 16, "#fdba74");
+  }
+  function draw() {
+    if (!A) return;
+    ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.drawImage(base, 0, 0);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    for (const s of A.sections) path(s.path || [s.p0, s.p1], "#22d3ee", 3, s.name, false);
+    if (poly.length) path(poly, "#f97316", 3, null, false);
+    if (drag) { path([drag.from, drag.to], "#f97316", 3, null, true); segLabel(drag.from, drag.to); }
+  }
+  function ui() {
+    $("mLine").classList.toggle("on", mode === "line"); $("mPoly").classList.toggle("on", mode === "poly");
+    $("bFinish").disabled = !(mode === "poly" && poly.length >= 2);
+    $("bUndo").disabled = !(mode === "poly" && poly.length >= 1);
+    help.innerHTML = mode === "line"
+      ? "<b>Drag</b> = draw section &nbsp;·&nbsp; <b>Shift</b> = straight H/V<br><b>Right-drag</b> pan · <b>Wheel</b> zoom · <b>F</b> fit · <b>Esc</b> cancel"
+      : "<b>Drag</b> = add segment (starts at last vertex) &nbsp;·&nbsp; <b>Shift</b> = straight H/V<br><b>Enter / double-click</b> finish · <b>Backspace</b> undo · <b>Esc</b> cancel";
+  }
+
+  // ---- interaction -------------------------------------------------------------
+  function pos(e) { const r = cv.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; }
+  function endpoint(e, from) {
+    let w = s2w(...pos(e));
+    if (e.shiftKey && from) {                       // orthogonal: lock to the dominant axis
+      const dx = w[0] - from[0], dy = w[1] - from[1];
+      w = Math.abs(dx) >= Math.abs(dy) ? [w[0], from[1]] : [from[0], w[1]];
+    }
+    return w;
+  }
+  function submit(pathPts) {
+    if (pathPts.length < 2) return;
+    send("streamlit:setComponentValue", { dataType: "json",
+      value: { id: Date.now() + "-" + Math.random().toString(36).slice(2, 7), path: pathPts } });
+  }
+  function finishPoly() { if (mode === "poly" && poly.length >= 2) { const p = poly; poly = []; drag = null; submit(p); draw(); ui(); } }
+  function cancel() { poly = []; drag = null; draw(); ui(); }
+
+  cv.addEventListener("contextmenu", e => e.preventDefault());
+  cv.addEventListener("mousedown", e => {
+    if (!A) return;
+    if (e.button === 0) {
+      const w = s2w(...pos(e));
+      const from = (mode === "poly" && poly.length) ? poly[poly.length - 1] : w;    // polyline continues from last vertex
+      drag = { from: from, to: mode === "poly" && poly.length ? endpoint(e, from) : w };
+    } else if (e.button === 1 || e.button === 2) {
+      panning = { x: e.clientX, y: e.clientY, px: panx, py: pany }; e.preventDefault();
+    }
+  });
+  window.addEventListener("mousemove", e => {
+    if (!A) return;
+    const [sx, sy] = pos(e);
+    if (sx >= 0 && sx <= W && sy >= 0 && sy <= H) {
+      const w = s2w(sx, sy); hud.textContent = "X " + w[0].toFixed(2) + ",  Y " + w[1].toFixed(2) + "  (" + A.unit + ")";
+    }
+    if (panning) { panx = panning.px + (e.clientX - panning.x); pany = panning.py + (e.clientY - panning.y); drawBase(); draw(); }
+    else if (drag) { drag.to = endpoint(e, drag.from); draw(); }
+  });
+  window.addEventListener("mouseup", e => {
+    if (panning) { panning = null; return; }
+    if (!drag || e.button !== 0) return;
+    const from = drag.from, to = endpoint(e, from); drag = null;
+    const a = w2s(...from), b = w2s(...to);
+    if (Math.hypot(a[0]-b[0], a[1]-b[1]) > 4) {                    // ignore plain clicks
+      if (mode === "line") submit([from, to]);                      // one call, only when the drag ends
+      else { if (!poly.length) poly.push(from); poly.push(to); }
+    }
+    draw(); ui();
+  });
+  window.addEventListener("keydown", e => {
+    if (e.key === "Escape") cancel();
+    else if (e.key === "Enter") finishPoly();
+    else if (e.key === "Backspace" && mode === "poly" && poly.length) { poly.pop(); if (poly.length < 2) poly = poly.slice(0, 0); draw(); ui(); e.preventDefault(); }
+    else if (e.key === "f" || e.key === "F") { if (A) { fit(); drawBase(); draw(); } }
+  });
+  cv.addEventListener("wheel", e => {
+    if (!A) return; e.preventDefault();
+    const [sx, sy] = pos(e), before = s2w(sx, sy);
+    k *= Math.exp(-e.deltaY * 0.0015);
+    const after = w2s(before[0], before[1]); panx += sx - after[0]; pany += sy - after[1];
+    drawBase(); draw();
+  }, { passive: false });
+  cv.addEventListener("dblclick", () => finishPoly());
+
+  $("mLine").onclick = () => { mode = "line"; poly = []; drag = null; draw(); ui(); };
+  $("mPoly").onclick = () => { mode = "poly"; poly = []; drag = null; draw(); ui(); };
+  $("bFinish").onclick = finishPoly;
+  $("bUndo").onclick = () => { if (poly.length) { poly.pop(); if (poly.length < 2) poly = []; draw(); ui(); } };
+  $("bFit").onclick = () => { if (A) { fit(); drawBase(); draw(); } };
+  ui();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,421 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root { --bg:#0f172a; --panel:#111c33; --line:#26344f; --txt:#cbd5e1; --mut:#7c8ba3; --acc:#38bdf8; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); overflow:hidden; font:12px/1.35 system-ui,Segoe UI,sans-serif; color:var(--txt); }
+  #bar { display:flex; align-items:center; gap:10px; padding:6px 8px; background:var(--panel); border:1px solid var(--line);
+         border-radius:10px 10px 0 0; flex-wrap:wrap; }
+  .tabs { display:flex; gap:2px; background:#0b1326; padding:2px; border-radius:7px; }
+  .tab { border:0; background:transparent; color:var(--mut); padding:4px 12px; border-radius:5px; cursor:pointer; font:inherit; font-weight:600; }
+  .tab.on { background:var(--acc); color:#04121f; }
+  .grp { display:flex; align-items:center; gap:5px; color:var(--mut); }
+  .grp button, .grp select { background:#0b1326; color:var(--txt); border:1px solid var(--line); border-radius:5px; padding:3px 8px; font:inherit; cursor:pointer; }
+  .grp button.on { background:#155e75; border-color:var(--acc); color:#fff; }
+  .grp input[type=range] { width:110px; accent-color:var(--acc); }
+  .grp input[type=checkbox] { accent-color:var(--acc); }
+  .val { min-width:44px; color:var(--txt); font-variant-numeric:tabular-nums; }
+  .sep { width:1px; height:18px; background:var(--line); }
+  #stage { position:relative; border:1px solid var(--line); border-top:0; border-radius:0 0 10px 10px; overflow:hidden; }
+  canvas { display:block; }
+  .hint { position:absolute; left:10px; bottom:8px; padding:3px 8px; border-radius:5px; background:rgba(15,23,42,.85);
+          color:var(--mut); font-size:11px; pointer-events:none; }
+  #info { position:absolute; right:10px; top:8px; padding:5px 9px; border-radius:6px; background:rgba(15,23,42,.88);
+          color:var(--txt); font-size:11.5px; pointer-events:none; text-align:right; line-height:1.5; }
+  #vsec { display:none; }
+  #shint { left:auto; right:10px; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <div class="tabs">
+    <button class="tab on" id="t3d">3D View</button>
+    <button class="tab" id="tsec">Section View</button>
+  </div>
+  <div class="sep"></div>
+  <div class="grp" id="g-dir">Cut plane
+    <button id="bx" class="on">⟂ X</button><button id="by">⟂ Y</button>
+  </div>
+  <div class="grp">Angle <input type="range" id="ang" min="0" max="179" step="1" value="0"><span class="val" id="angv">0°</span></div>
+  <div class="grp" id="g-clip">Hide
+    <select id="clip"><option value="0">nothing</option><option value="1">side A</option><option value="2">side B</option></select>
+  </div>
+  <div class="grp"><label><input type="checkbox" id="face" checked> Cut face</label></div>
+  <div class="grp" id="g-vex" style="display:none">V. exag
+    <select id="vex"><option value="0">Auto fit</option><option value="1">1×</option><option value="2">2×</option><option value="5">5×</option><option value="10">10×</option></select>
+  </div>
+  <div class="grp" style="margin-left:auto"><button id="reset">Reset</button></div>
+</div>
+<div id="stage">
+  <div id="v3d"><canvas id="c3"></canvas>
+    <div id="info"></div>
+    <div class="hint">Drag the <b style="color:#67e8f9">cyan plane</b> to move the cut · drag elsewhere = orbit · right-drag = pan · wheel = zoom</div>
+  </div>
+  <div id="vsec"><canvas id="cs"></canvas>
+    <div class="hint" id="shint">Move the cursor over the section to read RL</div>
+  </div>
+</div>
+
+<script src="three.min.js"></script>
+<script>
+(function () {
+  const T = THREE;
+  const $ = id => document.getElementById(id);
+  const c3 = $("c3"), cs = $("cs"), sctx = cs.getContext("2d");
+  let A = null, sig = null, W = 800, H = 640, dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+  // ------------------------------------------------------------ streamlit protocol
+  function send(type, data) { window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type }, data), "*"); }
+  window.addEventListener("message", e => {
+    if (!e.data || e.data.type !== "streamlit:render") return;
+    const first = !A; A = e.data.args; H = A.height || 640;
+    if (sig !== A.sig) { sig = A.sig; build(); }
+    layout();
+  });
+  send("streamlit:componentReady", { apiVersion: 1 });
+
+  // ------------------------------------------------------------ state
+  let theta = 0, d = 0, clipMode = 0, showFace = true, vexSel = 0, tab = "3d";
+  let cx = 0, cy = 0, ex = 1, floorZ = 0, diag = 1, dmin = 0, dmax = 0, hgt = 1;
+  let renderer = null, scene, camera, terrain, block, plinthMesh, planeMesh, planeEdge, curve, face;
+  let clipPlane = new T.Plane(new T.Vector3(1, 0, 0), 0);
+  let segs = [];
+  let az = 0.8, el = 0.6, radius = 3, target = new T.Vector3();
+  const homeView = {};
+
+  const STOPS = [[0,[43,108,176]],[0.15,[47,133,90]],[0.4,[163,191,94]],[0.6,[230,214,144]],[0.8,[160,120,90]],[1,[247,250,252]]];
+  function rgb(t) {
+    t = Math.max(0, Math.min(1, t));
+    for (let i = 1; i < STOPS.length; i++) if (t <= STOPS[i][0]) {
+      const a = STOPS[i-1], b = STOPS[i], f = (t - a[0]) / (b[0] - a[0]);
+      return [0,1,2].map(j => (a[1][j] + f * (b[1][j] - a[1][j])) / 255);
+    }
+    return [.97,.98,.99];
+  }
+  const nrm = () => [Math.cos(theta), Math.sin(theta)];
+  const n3 = () => new T.Vector3(Math.cos(theta), 0, -Math.sin(theta));
+
+  // ------------------------------------------------------------ scene
+  function build() {
+    const P = A.pts, TR = A.tris, N = P.length;
+    let x0 = 1e18, x1 = -1e18, y0 = 1e18, y1 = -1e18;
+    for (const p of P) { x0 = Math.min(x0,p[0]); x1 = Math.max(x1,p[0]); y0 = Math.min(y0,p[1]); y1 = Math.max(y1,p[1]); }
+    cx = (x0+x1)/2; cy = (y0+y1)/2; ex = A.zexag || 1;
+    floorZ = A.floor;
+    diag = Math.hypot(x1-x0, y1-y0) || 1;
+    hgt = (A.zmax - floorZ) * ex;
+
+    if (!renderer) {
+      renderer = new T.WebGLRenderer({ canvas: c3, antialias: true });
+      renderer.localClippingEnabled = true;
+    } else { scene.traverse(o => { if (o.geometry) o.geometry.dispose(); }); }
+    scene = new T.Scene(); scene.background = new T.Color(0x0f172a);
+    camera = new T.PerspectiveCamera(40, 1, diag * 0.01, diag * 20);
+    scene.add(new T.HemisphereLight(0xffffff, 0x445566, 0.75));
+    const sun = new T.DirectionalLight(0xffffff, 0.8); sun.position.set(diag, diag * 1.5, diag * 0.6); scene.add(sun);
+
+    // terrain
+    const pos = new Float32Array(N*3), col = new Float32Array(N*3);
+    const zr = Math.max(A.zmax - A.zmin, 1e-9);
+    for (let i = 0; i < N; i++) {
+      pos.set([P[i][0]-cx, P[i][2]*ex, -(P[i][1]-cy)], i*3);
+      col.set(rgb((P[i][2]-A.zmin)/zr), i*3);
+    }
+    const tg = new T.BufferGeometry();
+    tg.setAttribute("position", new T.BufferAttribute(pos, 3));
+    tg.setAttribute("color", new T.BufferAttribute(col, 3));
+    tg.setIndex(new T.BufferAttribute(new Uint32Array(TR.flat()), 1));
+    tg.computeVertexNormals();
+    terrain = new T.Mesh(tg, new T.MeshStandardMaterial({ vertexColors: true, side: T.DoubleSide, roughness: .92, metalness: 0 }));
+    scene.add(terrain);
+
+    // ground block (walls + floor)
+    const ec = new Map();
+    for (const t of TR) for (const [a,b] of [[t[0],t[1]],[t[1],t[2]],[t[2],t[0]]]) {
+      const k = a < b ? a*N+b : b*N+a; ec.set(k, (ec.get(k)||0)+1);
+    }
+    const bp = [], fy = floorZ * ex;
+    const top = i => [P[i][0]-cx, P[i][2]*ex, -(P[i][1]-cy)], bot = i => [P[i][0]-cx, fy, -(P[i][1]-cy)];
+    for (const [k,c] of ec) if (c === 1) {
+      const a = Math.floor(k/N), b = k % N;
+      bp.push(...top(a), ...top(b), ...bot(b),  ...top(a), ...bot(b), ...bot(a));
+    }
+    for (const t of TR) bp.push(...bot(t[0]), ...bot(t[1]), ...bot(t[2]));
+    const bg = new T.BufferGeometry(); bg.setAttribute("position", new T.Float32BufferAttribute(bp, 3)); bg.computeVertexNormals();
+    block = new T.Mesh(bg, new T.MeshStandardMaterial({ color: 0x8b6f4e, side: T.DoubleSide, roughness: 1 }));
+    scene.add(block);
+
+    // plinth
+    if (A.plinth !== null && A.plinth !== undefined) {
+      plinthMesh = new T.Mesh(new T.PlaneGeometry(x1-x0, y1-y0),
+        new T.MeshBasicMaterial({ color: 0x38bdf8, transparent: true, opacity: .28, side: T.DoubleSide, depthWrite: false }));
+      plinthMesh.rotation.x = -Math.PI/2; plinthMesh.position.set(0, A.plinth*ex, 0); scene.add(plinthMesh);
+    } else plinthMesh = null;
+
+    // cutting plane (unit quad, scaled/rotated in placePlane)
+    planeMesh = new T.Mesh(new T.PlaneGeometry(1, 1),
+      new T.MeshBasicMaterial({ color: 0x22d3ee, transparent: true, opacity: .22, side: T.DoubleSide, depthWrite: false }));
+    planeEdge = new T.LineSegments(new T.EdgesGeometry(new T.PlaneGeometry(1,1)), new T.LineBasicMaterial({ color: 0x67e8f9 }));
+    planeMesh.add(planeEdge); scene.add(planeMesh);
+
+    curve = new T.LineSegments(new T.BufferGeometry(), new T.LineBasicMaterial({ color: 0xfacc15 })); scene.add(curve);
+    face = new T.Mesh(new T.BufferGeometry(), new T.MeshBasicMaterial({ color: 0xb08d63, side: T.DoubleSide })); scene.add(face);
+
+    // camera home
+    radius = diag * 1.7; az = 0.75; el = 0.55; target.set(0, (A.zmin*ex + fy) / 2 + hgt*0.1, 0);
+    Object.assign(homeView, { radius, az, el, ty: target.y });
+    theta = 0; d = 0; setDir(0);
+    applyClip();
+  }
+
+  function setDir(deg) {
+    theta = deg * Math.PI / 180; $("ang").value = deg; $("angv").textContent = deg + "°";
+    $("bx").classList.toggle("on", deg === 0); $("by").classList.toggle("on", deg === 90);
+    // extent of the site along the normal -> drag limits
+    const [nx, ny] = nrm(); let lo = 1e18, hi = -1e18;
+    for (const p of A.pts) { const v = (p[0]-cx)*nx + (p[1]-cy)*ny; lo = Math.min(lo, v); hi = Math.max(hi, v); }
+    dmin = lo; dmax = hi; d = Math.max(dmin, Math.min(dmax, d));
+    update();
+  }
+
+  function applyClip() {
+    const mats = [terrain.material, block.material].concat(plinthMesh ? [plinthMesh.material] : []);
+    for (const m of mats) { m.clippingPlanes = clipMode ? [clipPlane] : null; m.needsUpdate = true; }
+    face.visible = showFace;
+    update();
+  }
+
+  // ------------------------------------------------------------ section geometry
+  function computeSection() {
+    const [nx, ny] = nrm(), P = A.pts, TR = A.tris, out = [];
+    const f = new Float64Array(P.length);
+    for (let i = 0; i < P.length; i++) { const v = (P[i][0]-cx)*nx + (P[i][1]-cy)*ny - d; f[i] = v === 0 ? 1e-9 : v; }
+    for (const t of TR) {
+      const fa = f[t[0]], fb = f[t[1]], fc = f[t[2]];
+      if ((fa > 0 && fb > 0 && fc > 0) || (fa < 0 && fb < 0 && fc < 0)) continue;
+      const pts = [];
+      for (const [i, j] of [[t[0],t[1]],[t[1],t[2]],[t[2],t[0]]]) {
+        if (f[i] * f[j] < 0) {
+          const s = f[i] / (f[i] - f[j]), a = P[i], b = P[j];
+          const X = a[0] + s*(b[0]-a[0]), Y = a[1] + s*(b[1]-a[1]), Z = a[2] + s*(b[2]-a[2]);
+          pts.push({ X, Y, Z, u: -(X-cx)*ny + (Y-cy)*nx });
+        }
+      }
+      if (pts.length === 2) out.push(pts[0].u <= pts[1].u ? [pts[0], pts[1]] : [pts[1], pts[0]]);
+    }
+    out.sort((p, q) => p[0].u - q[0].u);
+    return out;
+  }
+
+  function update() {
+    if (!A || !renderer) return;
+    const [nx, ny] = nrm(), n = n3();
+    // plane
+    const fy = floorZ * ex, topY = (A.zmax * ex) + hgt * 0.08, len = diag * 1.15;
+    planeMesh.scale.set(len, topY - fy, 1);
+    planeMesh.position.set(nx*d, (topY + fy)/2, -ny*d);
+    planeMesh.rotation.set(0, Math.atan2(n.x, n.z), 0);
+    // clip
+    if (clipMode === 1) clipPlane.set(n.clone(), -d); else clipPlane.set(n.clone().negate(), d);
+    // curve + face
+    segs = computeSection();
+    const lp = [], fp = [];
+    for (const [a, b] of segs) {
+      const A3 = [a.X-cx, a.Z*ex + 1e-3*diag, -(a.Y-cy)], B3 = [b.X-cx, b.Z*ex + 1e-3*diag, -(b.Y-cy)];
+      lp.push(...A3, ...B3);
+      const a0 = [A3[0], fy, A3[2]], b0 = [B3[0], fy, B3[2]];
+      fp.push(...A3, ...B3, ...b0, ...A3, ...b0, ...a0);
+    }
+    curve.geometry.dispose(); face.geometry.dispose();
+    curve.geometry = new T.BufferGeometry(); curve.geometry.setAttribute("position", new T.Float32BufferAttribute(lp, 3));
+    face.geometry = new T.BufferGeometry(); face.geometry.setAttribute("position", new T.Float32BufferAttribute(fp, 3));
+    face.visible = showFace;
+    // info
+    const ang = Math.round(theta * 180 / Math.PI);
+    $("info").innerHTML = "Plane ⟂ " + ang + "° &nbsp;·&nbsp; offset <b>" + d.toFixed(2) + "</b> " + A.unit + "<br>Length in cut: <b>" + sectionLength().toFixed(2) + "</b> " + A.unit;
+    if (tab === "sec") drawSection();
+    render();
+  }
+
+  function sectionLength() {
+    if (!segs.length) return 0;
+    return segs[segs.length-1][1].u - segs[0][0].u;
+  }
+
+  // ------------------------------------------------------------ 3D render + interaction
+  let raf = 0;
+  function render() { if (raf) return; raf = requestAnimationFrame(() => { raf = 0; if (tab === "3d") draw3(); }); }
+  function draw3() {
+    const cp = Math.cos(el), sp = Math.sin(el);
+    camera.position.set(target.x + radius*cp*Math.sin(az), target.y + radius*sp, target.z + radius*cp*Math.cos(az));
+    camera.lookAt(target);
+    renderer.render(scene, camera);
+  }
+  function layout() {
+    W = Math.max(320, Math.floor(document.documentElement.clientWidth));
+    const barH = $("bar").offsetHeight, sh = Math.max(300, H - barH);
+    $("stage").style.height = sh + "px";
+    renderer.setPixelRatio(dpr); renderer.setSize(W - 2, sh, false);
+    c3.style.width = (W - 2) + "px"; c3.style.height = sh + "px";
+    camera.aspect = (W - 2) / sh; camera.updateProjectionMatrix();
+    cs.width = (W - 2) * dpr; cs.height = sh * dpr; cs.style.width = (W - 2) + "px"; cs.style.height = sh + "px";
+    send("streamlit:setFrameHeight", { height: H });
+    render(); if (tab === "sec") drawSection();
+  }
+  window.addEventListener("resize", () => { if (A) layout(); });
+
+  const ray = new T.Raycaster(), mv = new T.Vector2();
+  function pick(e) {
+    const r = c3.getBoundingClientRect();
+    mv.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+    ray.setFromCamera(mv, camera);
+    return ray.intersectObject(planeMesh, false).length > 0;
+  }
+  function toScreen(v) {
+    const p = v.clone().project(camera), r = c3.getBoundingClientRect();
+    return [(p.x + 1) / 2 * r.width, (1 - p.y) / 2 * r.height];
+  }
+  let mode = null, last = null, dragInfo = null;
+  c3.addEventListener("contextmenu", e => e.preventDefault());
+  c3.addEventListener("pointerdown", e => {
+    c3.setPointerCapture(e.pointerId); last = [e.clientX, e.clientY];
+    if (e.button === 0 && pick(e)) {
+      mode = "plane";
+      const n = n3(), c0 = planeMesh.position.clone(), step = diag * 0.1;
+      const s0 = toScreen(c0), s1 = toScreen(c0.clone().addScaledVector(n, step));
+      const sv = [s1[0]-s0[0], s1[1]-s0[1]];
+      dragInfo = { d0: d, sv, step, m0: [e.clientX, e.clientY] };
+      planeMesh.material.opacity = .38; c3.style.cursor = "grabbing";
+    } else mode = (e.button === 0 && !e.shiftKey) ? "orbit" : "pan";
+  });
+  c3.addEventListener("pointermove", e => {
+    if (!mode) { const h = pick(e); c3.style.cursor = h ? "grab" : "default"; planeMesh.material.opacity = h ? .34 : .22; render(); return; }
+    const dx = e.clientX - last[0], dy = e.clientY - last[1]; last = [e.clientX, e.clientY];
+    if (mode === "orbit") {
+      az -= dx * 0.008; el = Math.max(-0.05, Math.min(1.55, el + dy * 0.008)); render();
+    } else if (mode === "pan") {
+      const k = radius * 0.0016, right = new T.Vector3(), up = new T.Vector3();
+      camera.matrixWorld.extractBasis(right, up, new T.Vector3());
+      target.addScaledVector(right, -dx * k).addScaledVector(up, dy * k); render();
+    } else if (mode === "plane") {
+      const { sv, step, m0, d0 } = dragInfo, L2 = sv[0]*sv[0] + sv[1]*sv[1];
+      const mx = e.clientX - m0[0], my = e.clientY - m0[1];
+      let dd = L2 > 16 ? (mx*sv[0] + my*sv[1]) / L2 * step : mx * diag / 600;
+      d = Math.max(dmin, Math.min(dmax, d0 + dd)); update();
+    }
+  });
+  const endDrag = () => { if (mode === "plane") { planeMesh.material.opacity = .22; c3.style.cursor = "default"; render(); } mode = null; };
+  c3.addEventListener("pointerup", endDrag); c3.addEventListener("pointercancel", endDrag);
+  c3.addEventListener("wheel", e => { e.preventDefault(); radius = Math.max(diag * 0.1, Math.min(diag * 8, radius * Math.exp(e.deltaY * 0.0012))); render(); }, { passive: false });
+
+  // ------------------------------------------------------------ section (2D) view
+  const ML = 62, MR = 18, MT = 46, MB = 38;
+  let secGeo = null;
+  function niceStep(r, n) { const raw = r / n, m = Math.pow(10, Math.floor(Math.log10(raw))), f = raw / m; return (f < 1.5 ? 1 : f < 3 ? 2 : f < 7 ? 5 : 10) * m; }
+
+  function drawSection() {
+    const w = cs.width / dpr, h = cs.height / dpr, ctx = sctx;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.fillStyle = "#0f172a"; ctx.fillRect(0, 0, w, h);
+    ctx.font = "11px system-ui"; ctx.textBaseline = "middle";
+    if (!segs.length) { ctx.fillStyle = "#7c8ba3"; ctx.textAlign = "center"; ctx.fillText("The plane does not intersect the terrain here.", w/2, h/2); secGeo = null; return; }
+    const u0 = segs[0][0].u, u1 = segs[segs.length-1][1].u;
+    let zt = -1e18; for (const [a,b] of segs) zt = Math.max(zt, a.Z, b.Z);
+    if (A.plinth !== null && A.plinth !== undefined) zt = Math.max(zt, A.plinth);
+    const zb = floorZ, zpad = (zt - zb) * 0.06; zt += zpad;
+    const aw = w - ML - MR, ah = h - MT - MB;
+    let sx = aw / Math.max(u1 - u0, 1e-9), sy = ah / Math.max(zt - zb, 1e-9);
+    if (vexSel > 0) { sy = Math.min(sy, sx * vexSel); }
+    const ox = ML + (aw - (u1-u0)*sx) / 2, oy = MT + ah;
+    const X = u => ox + (u - u0) * sx, Y = z => oy - (z - zb) * sy;
+    secGeo = { X, Y, u0, u1, sx, sy, zb };
+
+    // grid + axes
+    ctx.strokeStyle = "#1e2a44"; ctx.fillStyle = "#7c8ba3"; ctx.lineWidth = 1;
+    const su = niceStep(u1 - u0, 8), sz = niceStep(zt - zb, 6);
+    ctx.textAlign = "center";
+    for (let k = 0; u0 + k*su <= u1 + 1e-9; k++) { const u = u0 + k*su; ctx.beginPath(); ctx.moveTo(X(u), MT); ctx.lineTo(X(u), oy); ctx.stroke(); ctx.fillText((k*su).toFixed(su < 1 ? 1 : 0), X(u), oy + 14); }
+    ctx.textAlign = "right";
+    for (let z = Math.ceil(zb/sz)*sz; z <= zt; z += sz) { ctx.beginPath(); ctx.moveTo(ML, Y(z)); ctx.lineTo(w - MR, Y(z)); ctx.stroke(); ctx.fillText(z.toFixed(sz < 1 ? 2 : 1), ML - 6, Y(z)); }
+    ctx.textAlign = "center"; ctx.fillText("Chainage (" + A.unit + ")", ML + aw/2, h - 8);
+    ctx.save(); ctx.translate(12, MT + ah/2); ctx.rotate(-Math.PI/2); ctx.fillText("RL (" + A.unit + ")", 0, 0); ctx.restore();
+
+    // ground body
+    ctx.fillStyle = "#5e4b38"; ctx.beginPath();          // one polygon -> no seams between segments
+    segs.forEach(([a,b], i) => { if (i === 0) ctx.moveTo(X(a.u), Y(a.Z)); else ctx.lineTo(X(a.u), Y(a.Z)); ctx.lineTo(X(b.u), Y(b.Z)); });
+    ctx.lineTo(X(segs[segs.length-1][1].u), Y(zb)); ctx.lineTo(X(segs[0][0].u), Y(zb)); ctx.closePath(); ctx.fill();
+
+    // cut / fill vs plinth
+    let cutA = 0, fillA = 0;
+    if (A.plinth !== null && A.plinth !== undefined) {
+      const h0 = A.plinth;
+      const poly = (pts, c) => { ctx.fillStyle = c; ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(X(p[0]), Y(p[1])) : ctx.moveTo(X(p[0]), Y(p[1]))); ctx.closePath(); ctx.fill(); ctx.strokeStyle = c; ctx.lineWidth = 1; ctx.stroke(); };
+      for (const [a,b] of segs) {
+        const da = a.Z - h0, db = b.Z - h0, du = b.u - a.u;
+        if (da >= 0 && db >= 0) { poly([[a.u,a.Z],[b.u,b.Z],[b.u,h0],[a.u,h0]], "#b84a4a"); cutA += du*(da+db)/2; }
+        else if (da <= 0 && db <= 0) { poly([[a.u,h0],[b.u,h0],[b.u,b.Z],[a.u,a.Z]], "#3b6fc4"); fillA += du*(-da-db)/2; }
+        else {
+          const uc = a.u + du * da / (da - db);
+          const pos = da > 0 ? [[a.u,a.Z],[uc,h0],[a.u,h0]] : [[b.u,b.Z],[uc,h0],[b.u,h0]];
+          const neg = da > 0 ? [[b.u,b.Z],[uc,h0],[b.u,h0]] : [[a.u,a.Z],[uc,h0],[a.u,h0]];
+          poly(pos, "#b84a4a"); poly(neg, "#3b6fc4");
+          const tot = Math.abs(da) + Math.abs(db);
+          cutA += du * Math.max(da, db)**2 / (2*tot); fillA += du * Math.min(da, db)**2 / (2*tot);
+        }
+      }
+      ctx.strokeStyle = "#38bdf8"; ctx.setLineDash([7, 4]); ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(X(u0), Y(h0)); ctx.lineTo(X(u1), Y(h0)); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = "#38bdf8"; ctx.textAlign = "left"; ctx.fillText("Plinth " + h0.toFixed(2), X(u1) - 90, Y(h0) - 8);
+    }
+    // ground line
+    ctx.strokeStyle = "#facc15"; ctx.lineWidth = 2; ctx.beginPath();
+    segs.forEach(([a,b], i) => { ctx.moveTo(X(a.u), Y(a.Z)); ctx.lineTo(X(b.u), Y(b.Z)); }); ctx.stroke();
+
+    // header
+    ctx.textAlign = "left"; ctx.fillStyle = "#e2e8f0"; ctx.font = "bold 12px system-ui";
+    ctx.fillText("Section ⟂ " + Math.round(theta*180/Math.PI) + "°  ·  offset " + d.toFixed(2) + " " + A.unit + "  ·  length " + (u1-u0).toFixed(2) + " " + A.unit, ML, 16);
+    ctx.font = "11.5px system-ui";
+    if (A.plinth !== null && A.plinth !== undefined) {
+      ctx.fillStyle = "#fca5a5"; ctx.fillText("Cut area " + cutA.toFixed(2) + " " + A.unit + "²", ML, 34);
+      ctx.fillStyle = "#93c5fd"; ctx.fillText("Fill area " + fillA.toFixed(2) + " " + A.unit + "²", ML + 150, 34);
+      ctx.fillStyle = "#94a3b8"; ctx.fillText("Net " + (cutA - fillA >= 0 ? "+" : "") + (cutA - fillA).toFixed(2), ML + 300, 34);
+    }
+    ctx.fillStyle = "#7c8ba3"; ctx.textAlign = "right";
+    ctx.fillText("V.Ex ≈ " + (sy / sx).toFixed(1) + "×", w - MR, 16);
+  }
+  cs.addEventListener("mousemove", e => {
+    if (!secGeo || !segs.length) return;
+    const r = cs.getBoundingClientRect(), mxp = e.clientX - r.left;
+    const u = secGeo.u0 + (mxp - secGeo.X(secGeo.u0)) / secGeo.sx;
+    let z = null;
+    for (const [a,b] of segs) if (u >= a.u && u <= b.u) { z = a.Z + (b.Z - a.Z) * (u - a.u) / Math.max(b.u - a.u, 1e-12); break; }
+    drawSection();
+    if (z !== null) {
+      sctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      sctx.strokeStyle = "rgba(226,232,240,.5)"; sctx.setLineDash([3,3]); sctx.beginPath();
+      sctx.moveTo(secGeo.X(u), 42); sctx.lineTo(secGeo.X(u), secGeo.Y(secGeo.zb)); sctx.stroke(); sctx.setLineDash([]);
+      sctx.fillStyle = "#facc15"; sctx.beginPath(); sctx.arc(secGeo.X(u), secGeo.Y(z), 4, 0, 6.3); sctx.fill();
+    }
+    let txt = z !== null ? "Ch " + (u - secGeo.u0).toFixed(2) + "   RL " + z.toFixed(3) + (A.plinth != null ? "   Δ plinth " + (z - A.plinth >= 0 ? "+" : "") + (z - A.plinth).toFixed(3) : "") : "";
+    $("shint").textContent = txt || "Move the cursor over the section to read RL";
+  });
+
+  // ------------------------------------------------------------ controls
+  function setTab(t) {
+    tab = t; $("t3d").classList.toggle("on", t === "3d"); $("tsec").classList.toggle("on", t === "sec");
+    $("v3d").style.display = t === "3d" ? "block" : "none"; $("vsec").style.display = t === "sec" ? "block" : "none";
+    $("g-vex").style.display = t === "sec" ? "flex" : "none";
+    if (t === "sec") drawSection(); else render();
+  }
+  $("t3d").onclick = () => setTab("3d"); $("tsec").onclick = () => setTab("sec");
+  $("bx").onclick = () => { d = 0; setDir(0); applyClip(); }; $("by").onclick = () => { d = 0; setDir(90); applyClip(); };
+  $("ang").oninput = e => { setDir(+e.target.value); };
+  $("clip").onchange = e => { clipMode = +e.target.value; applyClip(); };
+  $("face").onchange = e => { showFace = e.target.checked; face.visible = showFace; render(); };
+  $("vex").onchange = e => { vexSel = +e.target.value; drawSection(); };
+  $("reset").onclick = () => { radius = homeView.radius; az = homeView.az; el = homeView.el; target.set(0, homeView.ty, 0); d = 0; setDir(Math.round(theta*180/Math.PI)); render(); };
+})();
+</script>
+</body>
+</html>

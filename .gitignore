@@ -1,0 +1,6 @@
+# Bundled portable runtime and vendored packages (restore with: pip install -r requirements.txt)
+python/
+libs/
+.venv/
+__pycache__/
+*.pyc
