@@ -119,7 +119,7 @@ st.markdown(
 
     /* ── Global density: smaller type, tighter spacing ─── */
     html { font-size: 14px; }
-    .block-container { padding: 1rem 1.6rem 2rem !important; max-width: 100% !important; }
+    .block-container { padding: 4.2rem 1.6rem 2rem !important; max-width: 100% !important; }
     div[data-testid="stVerticalBlock"] { gap: 0.6rem; }
     hr { margin: 0.6rem 0 !important; }
     h1 { font-size: 1.45rem !important; }
