@@ -9,6 +9,9 @@ set "PYTHONHOME="
 set "PYTHONNOUSERSITE=1"
 set "APP_DIR=%~dp0"
 set "PYEXE=%APP_DIR%python\python.exe"
+set "PORT=8501"
+set "URL=http://localhost:%PORT%"
+set "PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 
 if not exist "%PYEXE%" (
     echo  [ERROR] Bundled Python not found: "%PYEXE%"
@@ -19,18 +22,35 @@ if not exist "%PYEXE%" (
 
 cd /d "%APP_DIR%"
 
+REM ---------------------------------------------------------------
+REM Already running? Just open the existing tab. Starting a second
+REM server would double the memory use and open a second browser.
+REM ---------------------------------------------------------------
+"%PS%" -NoProfile -Command "$c=New-Object Net.Sockets.TcpClient;try{$c.Connect('127.0.0.1',%PORT%);exit 0}catch{exit 1}finally{$c.Dispose()}" >nul 2>&1
+if not errorlevel 1 (
+    echo.
+    echo  The viewer is already running on %URL%
+    echo  Opening it in your browser - no second copy started.
+    echo.
+    start "" "%URL%"
+    timeout /t 3 /nobreak >nul
+    exit /b 0
+)
+
 echo.
 echo  ==============================================================
 echo   DXF  -  3D Terrain Viewer
 echo  ==============================================================
-echo   Starting... your browser will open in a few seconds.
-echo   Address: http://localhost:8501
+echo   Starting... your browser opens as soon as the app is ready.
+echo   Address: %URL%
 echo   To stop, close this window or press Ctrl+C.
 echo  ==============================================================
 echo.
 
-start "" /b cmd /c "timeout /t 5 /nobreak >nul & start "" http://localhost:8501"
+REM Open the browser once, the moment the server starts answering
+REM (fixed wait times either opened too early or opened twice).
+start "" /b "%PS%" -NoProfile -WindowStyle Hidden -Command "for($i=0;$i -lt 240;$i++){$c=New-Object Net.Sockets.TcpClient;try{$c.Connect('127.0.0.1',%PORT%);$c.Dispose();Start-Process '%URL%';break}catch{Start-Sleep -Milliseconds 500}}"
 
-"%PYEXE%" -m streamlit run "%APP_DIR%app.py" --global.developmentMode=false --server.headless=true --browser.gatherUsageStats=false --theme.base=dark --theme.primaryColor="#38bdf8" --theme.backgroundColor="#0f172a" --theme.secondaryBackgroundColor="#1e293b" --theme.textColor="#e2e8f0"
+"%PYEXE%" -m streamlit run "%APP_DIR%app.py" --server.port=%PORT% --server.headless=true
 
 pause

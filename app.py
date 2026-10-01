@@ -8,7 +8,9 @@ Author  : ET Survey Tools
 Version : 1.0.0
 """
 
+import hashlib
 import io
+import os
 import re
 import tempfile
 from pathlib import Path
@@ -19,8 +21,9 @@ import plotly.graph_objects as go
 import plotly.io as pio
 import streamlit as st
 import streamlit.components.v1 as components
+import shapely
 from scipy.spatial import Delaunay
-from shapely.geometry import MultiPoint, Point, Polygon
+from shapely.geometry import Polygon
 
 pio.templates["plotly_dark"].layout.font.size = 11   # smaller chart text everywhere
 
@@ -231,6 +234,22 @@ CAMERAS = {
     "West": dict(eye=dict(x=-2.4, y=0.0, z=0.35), up=dict(x=0, y=0, z=1)),
 }
 
+# ──────────────────────────────────────────────────────────────────────
+# Rendering budgets
+# ──────────────────────────────────────────────────────────────────────
+# Survey DXFs can hold hundreds of thousands of spot levels (a 2.5 m grid
+# over a large parcel easily reaches 300 000). Triangulating all of them
+# gives ~2 triangles per point, and handing that many primitives to Plotly
+# or to the three.js views locks up the browser. Everything below these
+# ceilings is drawn in full; above them the app thins or skips, and says so.
+MAX_SURFACE_POINTS = 25_000     # default cap for the triangulated surface
+MAX_PREVIEW_LINE_PTS = 150_000  # vertices in the 2D background-geometry trace
+MAX_PREVIEW_MARKERS = 20_000    # markers per 2D scatter trace
+MAX_POINT_LABELS = 1_000        # per-point text labels (slowest Plotly mark)
+MAX_WIREFRAME_TRIS = 40_000     # triangles drawn as a wireframe overlay
+MAX_CONTOUR_SEGMENTS = 120_000  # contour segments across all levels
+MAX_WARNINGS = 200              # warnings kept from one extraction pass
+
 PLOT_CONFIG = {
     "scrollZoom": True,
     "displaylogo": False,
@@ -243,31 +262,54 @@ PLOT_CONFIG = {
 # ══════════════════════════════════════════════════════════════════════
 # Helper Functions
 # ══════════════════════════════════════════════════════════════════════
-@st.cache_data(show_spinner=False)
-def parse_dxf(file_bytes: bytes):
+def file_sig(file_bytes: bytes) -> str:
+    """Cheap, stable identity for an uploaded file, used as a cache key.
+
+    Hashing 100+ MB on every rerun would itself be a bottleneck, so only the
+    length plus the head and tail of the payload go into the digest.
+    """
+    h = hashlib.sha1()
+    h.update(str(len(file_bytes)).encode())
+    h.update(file_bytes[:262144])
+    h.update(file_bytes[-262144:])
+    return h.hexdigest()
+
+
+# The ezdxf document is held with cache_resource, NOT cache_data: cache_data
+# pickles its value and unpickles a fresh copy on every lookup, which for a
+# large survey DXF is ~100 MB of serialisation on every single widget change.
+@st.cache_resource(show_spinner=False, max_entries=1)
+def parse_dxf(_file_bytes: bytes, sig: str):
     """Read a DXF from raw bytes and return the ezdxf document."""
-    with tempfile.NamedTemporaryFile(suffix=".dxf", delete=False) as tmp:
-        tmp.write(file_bytes)
-        tmp.flush()
-        doc = ezdxf.readfile(tmp.name)
-    return doc
+    tmp = tempfile.NamedTemporaryFile(suffix=".dxf", delete=False)
+    try:
+        tmp.write(_file_bytes)
+        tmp.close()
+        return ezdxf.readfile(tmp.name)
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
 
 
-def get_layers(doc) -> list[str]:
-    """Return sorted unique layer names from all modelspace entities."""
-    return sorted({e.dxf.layer for e in doc.modelspace()})
-
-
-def get_entity_summary(doc) -> dict:
-    """Count entities by type."""
+# Every helper below walks the whole model space, so each one is cached on the
+# document signature. `_doc` is underscore-prefixed so Streamlit skips hashing
+# it and keys on `sig` instead.
+@st.cache_data(show_spinner=False, max_entries=2)
+def scan_dxf(_doc, sig: str) -> tuple[list[str], dict]:
+    """One pass over model space: sorted layer names and per-type entity counts."""
     summary: dict[str, int] = {}
-    for e in doc.modelspace():
+    layers: set[str] = set()
+    for e in _doc.modelspace():
+        layers.add(e.dxf.layer)
         t = e.dxftype()
         summary[t] = summary.get(t, 0) + 1
-    return summary
+    return sorted(layers), summary
 
 
-def extract_elevation_points(doc, layer: str) -> tuple[np.ndarray, list[str], list]:
+@st.cache_data(show_spinner=False, max_entries=8)
+def extract_elevation_points(_doc, layer: str, sig: str) -> tuple[np.ndarray, list[str], list]:
     """
     Extract (X, Y, Z) points from TEXT / MTEXT on *layer*.
 
@@ -275,12 +317,20 @@ def extract_elevation_points(doc, layer: str) -> tuple[np.ndarray, list[str], li
     -------
     points : ndarray of shape (N, 3)
     labels : list of raw text strings
-    warnings : list of warning messages
+    warnings : list of warning messages (capped at MAX_WARNINGS)
     """
     points, labels, warnings = [], [], []
     seen_xy: dict[tuple, float] = {}
+    suppressed = 0
 
-    msp = doc.modelspace()
+    def warn(msg: str) -> None:
+        nonlocal suppressed
+        if len(warnings) < MAX_WARNINGS:
+            warnings.append(msg)
+        else:
+            suppressed += 1
+
+    msp = _doc.modelspace()
     for entity in msp:
         if entity.dxf.layer != layer:
             continue
@@ -300,14 +350,14 @@ def extract_elevation_points(doc, layer: str) -> tuple[np.ndarray, list[str], li
         # Parse elevation
         m = ELEVATION_RE.search(raw)
         if m is None:
-            warnings.append(f"⚠️ Non-numeric text ignored: '{raw}' at ({x:.2f}, {y:.2f})")
+            warn(f"⚠️ Non-numeric text ignored: '{raw}' at ({x:.2f}, {y:.2f})")
             continue
         z = float(m.group(1))
 
         # Deduplicate
         key = (round(x, 4), round(y, 4))
         if key in seen_xy and abs(seen_xy[key] - z) > 0.001:
-            warnings.append(
+            warn(
                 f"⚠️ Duplicate XY ({x:.2f}, {y:.2f}) with different Z "
                 f"({seen_xy[key]:.3f} vs {z:.3f}) — keeping first."
             )
@@ -315,16 +365,66 @@ def extract_elevation_points(doc, layer: str) -> tuple[np.ndarray, list[str], li
         seen_xy[key] = z
 
         points.append([x, y, z])
-        labels.append(raw.strip())
+        if len(labels) < MAX_POINT_LABELS:
+            labels.append(raw.strip())
 
+    if suppressed:
+        warnings.append(f"… and {suppressed:,} more similar warnings (not listed).")
     if not points:
         return np.empty((0, 3)), labels, warnings
     return np.array(points), labels, warnings
 
 
-def extract_boundary(doc, layer: str) -> Polygon | None:
+def decimate_points(points: np.ndarray, max_points: int) -> np.ndarray:
+    """
+    Thin a dense point cloud down to roughly *max_points*, on a regular XY grid.
+
+    A 2.5 m spot-level grid over a large parcel can hold 300 000 points; the
+    resulting TIN has ~600 000 triangles, which no browser will draw. One point
+    per grid cell is kept (the one nearest the cell centre, so the sample stays
+    even), plus the highest and lowest points so relief is never clipped.
+    """
+    if max_points <= 0 or len(points) <= max_points:
+        return points
+
+    x, y = points[:, 0], points[:, 1]
+    x0, x1 = float(x.min()), float(x.max())
+    y0, y1 = float(y.min()), float(y.max())
+    span_x, span_y = max(x1 - x0, 1e-9), max(y1 - y0, 1e-9)
+    ratio = span_x / span_y
+
+    def thin(cells: int) -> np.ndarray:
+        """Indices of one point per occupied cell of a `cells`-cell grid."""
+        ny = max(int(np.sqrt(cells / ratio)), 1)
+        nx = max(cells // ny, 1)
+        cx = np.clip(((x - x0) / span_x * nx).astype(np.int64), 0, nx - 1)
+        cy = np.clip(((y - y0) / span_y * ny).astype(np.int64), 0, ny - 1)
+        cell = cx * ny + cy
+        # Distance to the cell centre, so each cell gives up its most central
+        # point and the surviving sample stays evenly spread.
+        mid_x = x0 + (cx + 0.5) * span_x / nx
+        mid_y = y0 + (cy + 0.5) * span_y / ny
+        dist = (x - mid_x) ** 2 + (y - mid_y) ** 2
+        order = np.lexsort((dist, cell))
+        return order[np.unique(cell[order], return_index=True)[1]]
+
+    keep = thin(max_points)
+    # Sites are rarely rectangular, so a fair share of cells come out empty and
+    # the first pass undershoots. Scale the grid up by the measured shortfall.
+    if len(keep) < 0.9 * max_points:
+        scaled = int(max_points * max_points / max(len(keep), 1))
+        retry = thin(min(scaled, 8 * max_points))
+        if max_points >= len(retry) > len(keep):
+            keep = retry
+
+    keep = np.union1d(keep, [int(points[:, 2].argmin()), int(points[:, 2].argmax())])
+    return points[keep]
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def extract_boundary(_doc, layer: str, sig: str) -> Polygon | None:
     """Return the first LWPOLYLINE / POLYLINE on *layer* as a Shapely Polygon."""
-    msp = doc.modelspace()
+    msp = _doc.modelspace()
     for entity in msp:
         if entity.dxf.layer != layer:
             continue
@@ -339,18 +439,26 @@ def extract_boundary(doc, layer: str) -> Polygon | None:
     return None
 
 
-def extract_all_entities_2d(doc) -> dict[str, list]:
+@st.cache_data(show_spinner=False, max_entries=2)
+def extract_all_entities_2d(_doc, sig: str, with_texts: bool = True) -> dict[str, list]:
     """
     Extract lightweight 2D geometry for every entity in model space.
-    Returns dict with keys: 'lines', 'circles', 'arcs', 'points', 'texts'.
-    Each value is a list of dicts suitable for Plotly traces.
+
+    Returns a dict of flat coordinate lists ready for Plotly traces. Line
+    vertices stop accumulating at MAX_PREVIEW_LINE_PTS and text positions are
+    skipped entirely when *with_texts* is false, so a drawing with a quarter of
+    a million labels still yields a payload the browser can render.
     """
     lines_x, lines_y = [], []
     pts_x, pts_y = [], []
     txt_x, txt_y, txt_labels = [], [], []
+    truncated = False
 
-    msp = doc.modelspace()
+    msp = _doc.modelspace()
     for e in msp:
+        if len(lines_x) > MAX_PREVIEW_LINE_PTS:
+            truncated = True
+            break
         dtype = e.dxftype()
         try:
             if dtype == "LINE":
@@ -394,6 +502,8 @@ def extract_all_entities_2d(doc) -> dict[str, list]:
                 pts_x.append(e.dxf.location[0])
                 pts_y.append(e.dxf.location[1])
             elif dtype in ("TEXT", "MTEXT"):
+                if not with_texts or len(txt_x) >= MAX_PREVIEW_MARKERS:
+                    continue
                 ins = e.dxf.insert
                 txt_x.append(ins[0])
                 txt_y.append(ins[1])
@@ -407,11 +517,12 @@ def extract_all_entities_2d(doc) -> dict[str, list]:
     return {
         "lines_x": lines_x,
         "lines_y": lines_y,
-        "pts_x": pts_x,
-        "pts_y": pts_y,
+        "pts_x": pts_x[:MAX_PREVIEW_MARKERS],
+        "pts_y": pts_y[:MAX_PREVIEW_MARKERS],
         "txt_x": txt_x,
         "txt_y": txt_y,
         "txt_labels": txt_labels,
+        "truncated": truncated,
     }
 
 
@@ -423,10 +534,11 @@ def build_2d_preview(
     """Build an interactive 2D Plotly preview of DXF entities."""
     fig = go.Figure()
 
-    # Background geometry
+    # Background geometry. Scattergl keeps these large traces on the GPU;
+    # the SVG renderer stalls the tab well before 100 000 vertices.
     if entities_2d["lines_x"]:
         fig.add_trace(
-            go.Scatter(
+            go.Scattergl(
                 x=entities_2d["lines_x"],
                 y=entities_2d["lines_y"],
                 mode="lines",
@@ -437,7 +549,7 @@ def build_2d_preview(
         )
     if entities_2d["pts_x"]:
         fig.add_trace(
-            go.Scatter(
+            go.Scattergl(
                 x=entities_2d["pts_x"],
                 y=entities_2d["pts_y"],
                 mode="markers",
@@ -448,7 +560,7 @@ def build_2d_preview(
         )
     if entities_2d["txt_x"]:
         fig.add_trace(
-            go.Scatter(
+            go.Scattergl(
                 x=entities_2d["txt_x"],
                 y=entities_2d["txt_y"],
                 mode="markers",
@@ -461,20 +573,24 @@ def build_2d_preview(
 
     # Elevation points highlight
     if elev_points is not None and len(elev_points) > 0:
+        shown = decimate_points(elev_points, MAX_PREVIEW_MARKERS)
+        # Per-point text labels are the single most expensive Plotly mark;
+        # past a thousand or so they are illegible anyway, so hover only.
+        labelled = len(shown) <= MAX_POINT_LABELS
         fig.add_trace(
-            go.Scatter(
-                x=elev_points[:, 0],
-                y=elev_points[:, 1],
-                mode="markers+text",
+            go.Scattergl(
+                x=shown[:, 0],
+                y=shown[:, 1],
+                mode="markers+text" if labelled else "markers",
                 marker=dict(
-                    size=9,
-                    color=elev_points[:, 2],
+                    size=9 if labelled else 5,
+                    color=shown[:, 2],
                     colorscale="Turbo",
                     showscale=True,
                     colorbar=dict(title="Elev", thickness=14, len=0.5),
-                    line=dict(width=1, color="white"),
+                    line=dict(width=1 if labelled else 0, color="white"),
                 ),
-                text=[f"{z:.2f}" for z in elev_points[:, 2]],
+                text=[f"{z:.2f}" for z in shown[:, 2]] if labelled else None,
                 textposition="top center",
                 textfont=dict(size=9, color="#38bdf8"),
                 name="Elevation Points",
@@ -486,7 +602,7 @@ def build_2d_preview(
     if boundary is not None:
         bx, by = boundary.exterior.xy
         fig.add_trace(
-            go.Scatter(
+            go.Scattergl(
                 x=list(bx),
                 y=list(by),
                 mode="lines",
@@ -520,9 +636,19 @@ def build_2d_preview(
     return fig
 
 
+def mesh_sig(points: np.ndarray, simplices: np.ndarray) -> str:
+    """Cheap identity for a (points, simplices) mesh, for use as a cache key."""
+    return (
+        f"{points.shape}|{simplices.shape}|"
+        f"{float(points[:, 0].sum()):.6f}|{float(points[:, 2].sum()):.6f}|"
+        f"{int(simplices.sum())}"
+    )
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
 def triangulate(
-    points: np.ndarray, boundary: Polygon | None = None
-) -> tuple[np.ndarray, np.ndarray]:
+    points: np.ndarray, _boundary: Polygon | None = None, bsig: str = ""
+) -> tuple[np.ndarray, np.ndarray, bool]:
     """
     Perform 2D Delaunay triangulation and optionally clip to boundary.
 
@@ -530,22 +656,23 @@ def triangulate(
     -------
     points : original points array (N, 3)
     simplices : triangle index array (M, 3)
+    clip_failed : True when the boundary removed every triangle (mesh unclipped)
     """
     tri = Delaunay(points[:, :2])
     simplices = tri.simplices
+    clip_failed = False
 
-    if boundary is not None:
-        keep = []
-        for simplex in simplices:
-            centroid = points[simplex, :2].mean(axis=0)
-            if boundary.contains(Point(centroid)):
-                keep.append(simplex)
-        if keep:
-            simplices = np.array(keep)
+    if _boundary is not None:
+        # One vectorised point-in-polygon test; the per-triangle Python loop
+        # it replaces took minutes on a half-million-triangle mesh.
+        c = points[simplices, :2].mean(axis=1)
+        inside = shapely.contains_xy(_boundary, c[:, 0], c[:, 1])
+        if inside.any():
+            simplices = simplices[inside]
         else:
-            st.warning("All triangles were clipped by the boundary. Showing unclipped mesh.")
+            clip_failed = True
 
-    return points, simplices
+    return points, simplices, clip_failed
 
 
 def build_3d_figure(
@@ -644,17 +771,17 @@ def build_3d_figure(
                     )
                 )
 
-    # Wireframe overlay
-    if show_wireframe:
-        edge_x, edge_y, edge_z = [], [], []
-        for s in simplices:
-            for a, b in [(s[0], s[1]), (s[1], s[2]), (s[2], s[0])]:
-                edge_x += [x[a], x[b], None]
-                edge_y += [y[a], y[b], None]
-                edge_z += [z[a], z[b], None]
+    # Wireframe overlay. Each triangle contributes 3 segments = 9 vertices, so
+    # a dense mesh would ship millions of coordinates; skipped past the budget.
+    if show_wireframe and len(simplices) <= MAX_WIREFRAME_TRIS:
+        a = simplices[:, [0, 1, 2]].ravel()
+        b = simplices[:, [1, 2, 0]].ravel()
+        gap = np.full(a.size, np.nan)
         fig.add_trace(
             go.Scatter3d(
-                x=edge_x, y=edge_y, z=edge_z,
+                x=np.column_stack([x[a], x[b], gap]).ravel(),
+                y=np.column_stack([y[a], y[b], gap]).ravel(),
+                z=np.column_stack([z[a], z[b], gap]).ravel(),
                 mode="lines",
                 line=dict(color="rgba(255,255,255,0.15)", width=1),
                 name="Wireframe",
@@ -721,41 +848,83 @@ def _compute_contour_lines(
     z_exag: float,
     color: str = "#facc15",
     width: int = 2,
+    max_segments: int = MAX_CONTOUR_SEGMENTS,
 ) -> list:
-    """Compute horizontal contour slices through the triangulated surface."""
-    traces = []
-    z_vals = points[:, 2]
-    for level in levels:
-        seg_x, seg_y, seg_z = [], [], []
-        for s in simplices:
-            tri_z = z_vals[s]
-            # Find edges that cross this level
-            crossings = []
-            for a, b in [(0, 1), (1, 2), (2, 0)]:
-                za, zb = tri_z[a], tri_z[b]
-                if (za - level) * (zb - level) < 0:
-                    t = (level - za) / (zb - za)
-                    ix = points[s[a], 0] + t * (points[s[b], 0] - points[s[a], 0])
-                    iy = points[s[a], 1] + t * (points[s[b], 1] - points[s[a], 1])
-                    crossings.append((ix, iy))
-                elif abs(za - level) < 1e-9:
-                    crossings.append((points[s[a], 0], points[s[a], 1]))
-            if len(crossings) >= 2:
-                seg_x += [crossings[0][0], crossings[1][0], None]
-                seg_y += [crossings[0][1], crossings[1][1], None]
-                seg_z += [level * z_exag, level * z_exag, None]
-        if seg_x:
-            traces.append(
-                go.Scatter3d(
-                    x=seg_x, y=seg_y, z=seg_z,
-                    mode="lines",
-                    line=dict(color=color, width=width),
-                    name=f"Contour {level:.2f}",
-                    hovertemplate=f"Contour: {level:.2f}<extra></extra>",
-                    showlegend=False,
-                )
+    """
+    Compute horizontal contour slices through the triangulated surface.
+
+    Marching triangles, vectorised over every triangle at once. The previous
+    per-triangle Python loop ran `levels × len(simplices)` times — on a
+    577 000-triangle mesh at 0.5 m intervals that is ~23 million iterations and
+    takes minutes. All levels are returned as a single trace (segments
+    separated by NaN) because one Plotly trace per contour level also costs the
+    browser dearly.
+    """
+    tx = points[simplices, 0]
+    ty = points[simplices, 1]
+    tz = points[simplices, 2]
+    # Triangle edges, as (from, to) vertex slots.
+    EA = np.array([0, 1, 2])
+    EB = np.array([1, 2, 0])
+
+    xs, ys, zs, lv = [], [], [], []
+    total = 0
+    for level in np.atleast_1d(np.asarray(levels, dtype=float)):
+        d = tz - level
+        # Nudge off any vertex sitting exactly on the plane, so each crossed
+        # triangle has a clean two-edge intersection instead of a degenerate one.
+        if np.any(np.abs(d) < 1e-12):
+            d = tz - (level + 1e-9 * max(abs(level), 1.0))
+
+        da, db = d[:, EA], d[:, EB]
+        cross = (da * db) < 0
+        sel = np.flatnonzero(cross.sum(axis=1) == 2)
+        if sel.size == 0:
+            continue
+        if total + sel.size > max_segments:
+            sel = sel[: max(max_segments - total, 0)]
+            if sel.size == 0:
+                break
+
+        # The two crossing edges of each selected triangle.
+        edges = np.argsort(~cross[sel], axis=1, kind="stable")[:, :2]
+
+        def cut(edge_col):
+            a, b = EA[edge_col], EB[edge_col]
+            r = np.arange(sel.size)
+            za, zb = d[sel, a], d[sel, b]
+            t = za / (za - zb)
+            return (
+                tx[sel, a] + t * (tx[sel, b] - tx[sel, a]),
+                ty[sel, a] + t * (ty[sel, b] - ty[sel, a]),
             )
-    return traces
+
+        x0, y0 = cut(edges[:, 0])
+        x1, y1 = cut(edges[:, 1])
+        gap = np.full(sel.size, np.nan)
+        xs.append(np.column_stack([x0, x1, gap]).ravel())
+        ys.append(np.column_stack([y0, y1, gap]).ravel())
+        zs.append(np.full(sel.size * 3, level * z_exag))
+        lv.append(np.full(sel.size * 3, level))
+        total += sel.size
+        if total >= max_segments:
+            break
+
+    if not xs:
+        return []
+    return [
+        go.Scatter3d(
+            x=np.concatenate(xs),
+            y=np.concatenate(ys),
+            z=np.concatenate(zs),
+            customdata=np.concatenate(lv),
+            mode="lines",
+            line=dict(color=color, width=width),
+            name="Contours",
+            hovertemplate="Contour: %{customdata:.2f}<extra></extra>",
+            showlegend=False,
+        )
+    ]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -770,17 +939,21 @@ def _tri_stats(points: np.ndarray, simplices: np.ndarray):
     return area, P[:, :, 2]
 
 
-def earthwork(points: np.ndarray, simplices: np.ndarray, level: float) -> dict:
-    """
-    Exact cut/fill volumes between the TIN surface and a horizontal plinth plane.
+@st.cache_data(show_spinner=False, max_entries=4)
+def tri_cache(points: np.ndarray, simplices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per-triangle plan area and *sorted* vertex elevations.
 
-    cut  = volume of ground ABOVE the plane (to be excavated)
-    fill = volume of ground BELOW the plane (to be filled)
-    Each triangle is linear, so the volume of the positive / negative part is
-    closed-form (pyramid on the sub-triangle where the surface crosses the plane).
+    All the volume maths needs the vertex elevations in ascending order. Sorting
+    half a million triangles costs ~100 ms, and the insights tab alone asks for
+    it 60+ times per rerun, so it is computed once and cached.
     """
     area, z = _tri_stats(points, simplices)
-    d = np.sort(z - level, axis=1)
+    return area, np.sort(z, axis=1)
+
+
+def earthwork_core(area: np.ndarray, zs: np.ndarray, level: float) -> dict:
+    """Cut/fill volumes from pre-sorted per-triangle elevations (see `earthwork`)."""
+    d = zs - level
     d0, d1, d2 = d[:, 0], d[:, 1], d[:, 2]
     s = d.sum(axis=1)
     vol_pos = np.zeros(len(area))
@@ -807,9 +980,22 @@ def earthwork(points: np.ndarray, simplices: np.ndarray, level: float) -> dict:
             "area": float(area.sum())}
 
 
-def _area_above(area: np.ndarray, z: np.ndarray, level: float) -> float:
-    """Plan area of the surface that lies above `level`."""
-    d = np.sort(z - level, axis=1)
+def earthwork(points: np.ndarray, simplices: np.ndarray, level: float) -> dict:
+    """
+    Exact cut/fill volumes between the TIN surface and a horizontal plinth plane.
+
+    cut  = volume of ground ABOVE the plane (to be excavated)
+    fill = volume of ground BELOW the plane (to be filled)
+    Each triangle is linear, so the volume of the positive / negative part is
+    closed-form (pyramid on the sub-triangle where the surface crosses the plane).
+    """
+    area, zs = tri_cache(points, simplices)
+    return earthwork_core(area, zs, level)
+
+
+def _area_above(area: np.ndarray, zs: np.ndarray, level: float) -> float:
+    """Plan area of the surface above `level`, from pre-sorted vertex elevations."""
+    d = zs - level
     d0, d1, d2 = d[:, 0], d[:, 1], d[:, 2]
     out = np.zeros(len(area))
     all_pos = d0 >= 0
@@ -823,6 +1009,7 @@ def _area_above(area: np.ndarray, z: np.ndarray, level: float) -> float:
     return float(out.sum())
 
 
+@st.cache_data(show_spinner=False, max_entries=4)
 def optimal_plinth(points: np.ndarray, simplices: np.ndarray) -> dict:
     """
     Two recommended plinth levels:
@@ -831,14 +1018,14 @@ def optimal_plinth(points: np.ndarray, simplices: np.ndarray) -> dict:
       minimum  : minimum cut+fill (least earth moved). Found where half of the plan
                  area is above the plane (area-weighted median), by bisection.
     """
-    area, z = _tri_stats(points, simplices)
+    area, zs = tri_cache(points, simplices)
     total_area = area.sum()
-    balanced = float((area * z.mean(axis=1)).sum() / total_area)
+    balanced = float((area * zs.mean(axis=1)).sum() / total_area)
 
-    lo, hi = float(z.min()), float(z.max())
-    for _ in range(60):
+    lo, hi = float(zs.min()), float(zs.max())
+    for _ in range(50):
         mid = 0.5 * (lo + hi)
-        if _area_above(area, z, mid) > total_area / 2:
+        if _area_above(area, zs, mid) > total_area / 2:
             lo = mid
         else:
             hi = mid
@@ -850,14 +1037,27 @@ def _key(simplices: np.ndarray, n: int) -> np.ndarray:
     return (s[:, 0] * n + s[:, 1]) * n + s[:, 2]
 
 
+@st.cache_resource(show_spinner=False, max_entries=2)
+def _tin_index(_points: np.ndarray, _simplices: np.ndarray, sig: str):
+    """Delaunay search structure plus a mask of which of its triangles were kept.
+
+    Cached because building it costs seconds on a large point set, and a single
+    multi-segment section profile used to rebuild it once per segment.
+    """
+    tri = Delaunay(_points[:, :2])
+    kept = np.isin(
+        _key(tri.simplices, len(_points)), _key(_simplices, len(_points))
+    )
+    return tri, kept
+
+
 def surface_z(points: np.ndarray, simplices: np.ndarray, xy: np.ndarray) -> np.ndarray:
     """Interpolate the TIN elevation at xy (N, 2); NaN outside the (clipped) mesh."""
-    tri = Delaunay(points[:, :2])
+    tri, kept = _tin_index(points, simplices, mesh_sig(points, simplices))
     sid = tri.find_simplex(xy)
     z = np.full(len(xy), np.nan)
     ok = sid >= 0
     if ok.any():
-        kept = np.isin(_key(tri.simplices, len(points)), _key(simplices, len(points)))
         ok &= kept[np.where(sid >= 0, sid, 0)]
     if ok.any():
         T = tri.transform[sid[ok]]
@@ -935,25 +1135,32 @@ def build_base_solid(
     points: np.ndarray, simplices: np.ndarray, base_z: float, z_exag: float
 ) -> go.Mesh3d | None:
     """Side walls + bottom face under the terrain so it reads as a block of ground."""
-    edge_count: dict[tuple[int, int], int] = {}
-    for s in simplices:
-        for a, b in ((s[0], s[1]), (s[1], s[2]), (s[2], s[0])):
-            k = (a, b) if a < b else (b, a)
-            edge_count[k] = edge_count.get(k, 0) + 1
-    boundary_edges = [e for e, c in edge_count.items() if c == 1]
-    if not boundary_edges:
+    # Boundary edges are those belonging to exactly one triangle. Found with
+    # np.unique rather than a Python dict, which took ~1.7 M operations per
+    # render on a half-million-triangle mesh.
+    e = np.sort(
+        np.column_stack(
+            [simplices[:, [0, 1, 2]].ravel(), simplices[:, [1, 2, 0]].ravel()]
+        ),
+        axis=1,
+    )
+    uniq, counts = np.unique(e, axis=0, return_counts=True)
+    boundary_edges = uniq[counts == 1]
+    if len(boundary_edges) == 0:
         return None
 
     n = len(points)
     top = np.c_[points[:, 0], points[:, 1], points[:, 2] * z_exag]
     bot = np.c_[points[:, 0], points[:, 1], np.full(n, base_z * z_exag)]
     verts = np.vstack([top, bot])
-    faces = []
-    for a, b in boundary_edges:
-        faces.append((a, b, b + n))
-        faces.append((a, b + n, a + n))
-    faces.extend((s[0] + n, s[1] + n, s[2] + n) for s in simplices)  # bottom
-    f = np.array(faces)
+    ba, bb = boundary_edges[:, 0], boundary_edges[:, 1]
+    f = np.vstack(
+        [
+            np.column_stack([ba, bb, bb + n]),          # wall, lower triangle
+            np.column_stack([ba, bb + n, ba + n]),      # wall, upper triangle
+            simplices + n,                               # bottom face
+        ]
+    )
     return go.Mesh3d(
         x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
         i=f[:, 0], j=f[:, 1], k=f[:, 2],
@@ -966,17 +1173,19 @@ def build_base_solid(
 # ──────────────────────────────────────────────────────────────────────
 # Export helpers
 # ──────────────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False, max_entries=2)
 def export_obj(points: np.ndarray, simplices: np.ndarray) -> str:
     """Export mesh as Wavefront .OBJ string."""
-    lines = ["# DXF-to-3D Terrain Export", f"# {len(points)} vertices, {len(simplices)} faces", ""]
-    for p in points:
-        lines.append(f"v {p[0]:.6f} {p[1]:.6f} {p[2]:.6f}")
-    lines.append("")
-    for s in simplices:
-        lines.append(f"f {s[0]+1} {s[1]+1} {s[2]+1}")
-    return "\n".join(lines)
+    buf = io.StringIO()
+    buf.write("# DXF-to-3D Terrain Export\n")
+    buf.write(f"# {len(points)} vertices, {len(simplices)} faces\n\n")
+    np.savetxt(buf, points, fmt="v %.6f %.6f %.6f")
+    buf.write("\n")
+    np.savetxt(buf, simplices + 1, fmt="f %d %d %d")
+    return buf.getvalue()
 
 
+@st.cache_data(show_spinner=False, max_entries=2)
 def export_dxf_3dface(points: np.ndarray, simplices: np.ndarray) -> bytes:
     """Export mesh as a DXF with 3DFACE entities."""
     doc = ezdxf.new("R2010")
@@ -1018,12 +1227,14 @@ def main():
         return
 
     # ── Parse DXF ────────────────────────────────────────────────────
-    file_bytes = uploaded.read()
+    # getvalue(), not read(): the uploader's buffer position survives reruns,
+    # so read() returns b"" the second time round.
+    file_bytes = uploaded.getvalue()
+    sig = file_sig(file_bytes)
     with st.spinner("Parsing DXF…"):
-        doc = parse_dxf(file_bytes)
+        doc = parse_dxf(file_bytes, sig)
 
-    layers = get_layers(doc)
-    entity_summary = get_entity_summary(doc)
+    layers, entity_summary = scan_dxf(doc, sig)
     total_entities = sum(entity_summary.values())
 
     # ── Overview Metrics ─────────────────────────────────────────────
@@ -1055,11 +1266,24 @@ def main():
                 layers,
                 help="Layer with LWPOLYLINE/POLYLINE defining site perimeter",
             )
+        max_pts = st.select_slider(
+            "🎚️ Surface detail (max points)",
+            options=[5_000, 10_000, 25_000, 50_000, 100_000, 0],
+            value=MAX_SURFACE_POINTS,
+            format_func=lambda v: "No limit (slow)" if v == 0 else f"{v:,}",
+            help="Dense spot-level grids are thinned to this many points before "
+                 "triangulating. Higher = more detail but much slower, and very "
+                 "large meshes can freeze the browser. Volumes change slightly "
+                 "with the thinning; use 'No limit' for a final quantity take-off.",
+        )
         st.divider()
 
     # ── Extract Data ─────────────────────────────────────────────────
-    elev_points, labels, warnings = extract_elevation_points(doc, level_layer)
-    boundary = extract_boundary(doc, boundary_layer) if boundary_layer else None
+    all_points, labels, warnings = extract_elevation_points(doc, level_layer, sig)
+    boundary = extract_boundary(doc, boundary_layer, sig) if boundary_layer else None
+
+    elev_points = decimate_points(all_points, max_pts)
+    thinned = len(elev_points) < len(all_points)
 
     if use_boundary and boundary_layer and boundary is None:
         st.sidebar.warning(f"No valid polyline found on layer '{boundary_layer}'.")
@@ -1073,7 +1297,18 @@ def main():
             c1.metric(f"Min RL ({u1()})", f"{z_vals.min():.2f}")
             c2.metric(f"Max RL ({u1()})", f"{z_vals.max():.2f}")
             c3.metric(f"Relief ({u1()})", f"{z_vals.max() - z_vals.min():.2f}")
-            st.metric("Points Found", f"{len(elev_points)}")
+            st.metric(
+                "Points Found",
+                f"{len(elev_points):,}",
+                f"thinned from {len(all_points):,}" if thinned else None,
+                delta_color="off",
+            )
+            if thinned:
+                st.caption(
+                    f"⚡ {len(all_points):,} spot levels found; using {len(elev_points):,} "
+                    "on an even grid to keep the viewer responsive. Raise **Surface "
+                    "detail** above for finer results."
+                )
         else:
             st.warning("No elevation points extracted.")
         st.divider()
@@ -1093,7 +1328,10 @@ def main():
     opt = None
     if has_surface:
         with st.spinner("Triangulating…"):
-            pts, simplices = triangulate(elev_points, boundary)
+            bsig = boundary.wkb_hex[:64] if boundary is not None else ""
+            pts, simplices, clip_failed = triangulate(elev_points, boundary, bsig)
+        if clip_failed:
+            st.warning("All triangles were clipped by the boundary. Showing unclipped mesh.")
         st.sidebar.metric("Triangles", f"{len(simplices):,}")
 
         relief = float(pts[:, 2].max() - pts[:, 2].min())
@@ -1144,9 +1382,31 @@ def main():
     with tab_2d:
         st.markdown("#### 2D DXF Preview")
         st.caption("Elevation points are highlighted. Hover for details.")
-        entities_2d = extract_all_entities_2d(doc)
-        fig_2d = build_2d_preview(entities_2d, elev_points, boundary)
-        st.plotly_chart(fig_2d, use_container_width=True, key="preview_2d")
+        # Streamlit executes the body of every tab on every rerun, visible or
+        # not. For a drawing with ~300 000 entities the preview costs more than
+        # everything else combined, so it is drawn on request.
+        heavy = total_entities > 50_000
+        if heavy:
+            st.info(
+                f"This drawing has {total_entities:,} entities. The full 2D preview is "
+                "the slowest view, so it is off by default."
+            )
+        if st.checkbox("Show 2D preview", value=not heavy, key="show_2d"):
+            with_texts = st.checkbox(
+                "Include all text markers",
+                value=not heavy,
+                key="prev_texts",
+                help="Positions of every TEXT/MTEXT entity in the drawing.",
+            )
+            with st.spinner("Building 2D preview…"):
+                entities_2d = extract_all_entities_2d(doc, sig, with_texts)
+                fig_2d = build_2d_preview(entities_2d, elev_points, boundary)
+            if entities_2d.get("truncated"):
+                st.caption(
+                    "⚡ Background geometry truncated for speed — the elevation points "
+                    "and boundary are complete."
+                )
+            st.plotly_chart(fig_2d, use_container_width=True, key="preview_2d")
 
     # ── 3D Terrain Tab ───────────────────────────────────────────────
     with tab_3d:
@@ -1176,7 +1436,14 @@ def main():
                     "Z exag. (×)", min_value=0.1, max_value=50.0, value=1.0, step=0.5, format="%.1f"
                 )
             with col_d:
-                show_wire = st.checkbox("Wireframe", value=False, disabled=cutter_on)
+                wire_ok = len(simplices) <= MAX_WIREFRAME_TRIS
+                show_wire = st.checkbox(
+                    "Wireframe", value=False, disabled=cutter_on or not wire_ok,
+                    help="Wireframe" if wire_ok else
+                         f"Unavailable above {MAX_WIREFRAME_TRIS:,} triangles "
+                         f"(this mesh has {len(simplices):,}) — lower Surface detail "
+                         "in the sidebar to enable it.",
+                )
             with col_e:
                 view = st.selectbox(
                     "Camera view", list(CAMERAS), key="cam_view", disabled=cutter_on,
@@ -1230,35 +1497,46 @@ def main():
         st.markdown("#### Export 3D Mesh")
         st.caption("Download the triangulated terrain in your preferred format.")
 
+        st.caption(f"Mesh: {len(pts):,} vertices · {len(simplices):,} triangles")
+
+        # Both exports are built on demand. Generating them eagerly meant every
+        # widget change anywhere in the app rebuilt a full 3DFACE DXF — minutes
+        # of work for a mesh this size, on a tab the user may never open.
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("##### 📦 Wavefront OBJ")
             st.caption("Compatible with Blender, SketchUp, Rhino, and most 3D software.")
-            obj_data = export_obj(pts, simplices)
-            st.download_button(
-                "⬇️ Download .OBJ",
-                data=obj_data,
-                file_name="terrain_mesh.obj",
-                mime="text/plain",
-                use_container_width=True,
-            )
+            if st.button("Prepare .OBJ", use_container_width=True, key="prep_obj"):
+                with st.spinner("Building OBJ…"):
+                    st.session_state.obj_data = export_obj(pts, simplices)
+            if st.session_state.get("obj_data"):
+                st.download_button(
+                    "⬇️ Download .OBJ",
+                    data=st.session_state.obj_data,
+                    file_name="terrain_mesh.obj",
+                    mime="text/plain",
+                    use_container_width=True,
+                )
 
         with col2:
             st.markdown("##### 📐 AutoCAD DXF (3DFACE)")
             st.caption("Import directly into AutoCAD, Civil 3D, or BricsCAD.")
-            dxf_data = export_dxf_3dface(pts, simplices)
-            st.download_button(
-                "⬇️ Download .DXF",
-                data=dxf_data,
-                file_name="terrain_mesh.dxf",
-                mime="application/octet-stream",
-                use_container_width=True,
-            )
+            if st.button("Prepare .DXF", use_container_width=True, key="prep_dxf"):
+                with st.spinner("Building DXF — this can take a while for a large mesh…"):
+                    st.session_state.dxf_data = export_dxf_3dface(pts, simplices)
+            if st.session_state.get("dxf_data"):
+                st.download_button(
+                    "⬇️ Download .DXF",
+                    data=st.session_state.dxf_data,
+                    file_name="terrain_mesh.dxf",
+                    mime="application/octet-stream",
+                    use_container_width=True,
+                )
 
 
 def _insights_tab(pts, simplices, plinth, mode, opt):
     """Dedicated cut & fill report for the selected plinth."""
-    area, zt = _tri_stats(pts, simplices)
+    area, zs = tri_cache(pts, simplices)
     total_area = float(area.sum())
     z_lo, z_hi = float(pts[:, 2].min()), float(pts[:, 2].max())
 
@@ -1267,8 +1545,8 @@ def _insights_tab(pts, simplices, plinth, mode, opt):
         st.info("Choose a plinth option in the sidebar (Manual, Balanced or Least earthwork) to see the report.")
         return
 
-    ew = earthwork(pts, simplices, plinth)
-    a_cut = _area_above(area, zt, plinth)
+    ew = earthwork_core(area, zs, plinth)
+    a_cut = _area_above(area, zs, plinth)
     a_fill = total_area - a_cut
     st.caption(f"Plinth mode: **{mode}** · Plinth level: **RL {plinth:.3f} {u1()}**")
 
@@ -1315,8 +1593,8 @@ def _insights_tab(pts, simplices, plinth, mode, opt):
                "The cut/fill figures above are bank (in-situ) volumes.")
 
     st.markdown("##### Earthwork vs plinth level")
-    levels = np.linspace(z_lo, z_hi, 60)
-    res = [earthwork(pts, simplices, lv) for lv in levels]
+    levels = np.linspace(z_lo, z_hi, 40)
+    res = [earthwork_core(area, zs, lv) for lv in levels]
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=levels, y=[r["cut"] for r in res], name="Cut", line=dict(color="#ef4444", width=3)))
     fig.add_trace(go.Scatter(x=levels, y=[r["fill"] for r in res], name="Fill", line=dict(color="#3b82f6", width=3)))
@@ -1338,7 +1616,7 @@ def _insights_tab(pts, simplices, plinth, mode, opt):
         rows.insert(0, ("Your level", plinth))
     table = []
     for name, lv in rows:
-        r = earthwork(pts, simplices, lv)
+        r = earthwork_core(area, zs, lv)
         table.append({
             "Option": name, f"RL ({u1()})": round(lv, 3),
             f"Cut ({u3()})": round(r["cut"], 1), f"Fill ({u3()})": round(r["fill"], 1),

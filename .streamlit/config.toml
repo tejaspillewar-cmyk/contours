@@ -1,3 +1,27 @@
+[global]
+# The vendored `libs/streamlit` looks like a source checkout to Streamlit, so it
+# turns developmentMode on by default — which rejects server.port outright.
+developmentMode = false
+
+[server]
+# Never let Streamlit open a browser itself — the launcher scripts do that,
+# exactly once, after the port answers.
+headless = true
+port = 8501
+# The bundled `libs/` folder holds ~6 500 .py files inside the app directory.
+# Streamlit's default watcher puts a filesystem observer on every local module
+# it imports, which means watching all of them: constant disk and CPU load that
+# slows the whole machine down. Nothing here is edited at runtime, so: off.
+fileWatcherType = "none"
+maxUploadSize = 1024
+maxMessageSize = 1024
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+
 [theme]
 base = "dark"
 primaryColor = "#38bdf8"

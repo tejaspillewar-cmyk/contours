@@ -4,6 +4,25 @@ title DXF to 3D Terrain Viewer - Setup and Run
 color 0B
 cd /d "%~dp0"
 
+set "PORT=8501"
+set "URL=http://localhost:%PORT%"
+set "PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+
+REM ---------------------------------------------------------------
+REM Already running? Just open the existing tab. Starting a second
+REM server would double the memory use and open a second browser.
+REM ---------------------------------------------------------------
+"%PS%" -NoProfile -Command "$c=New-Object Net.Sockets.TcpClient;try{$c.Connect('127.0.0.1',%PORT%);exit 0}catch{exit 1}finally{$c.Dispose()}" >nul 2>&1
+if not errorlevel 1 (
+    echo.
+    echo  The viewer is already running on %URL%
+    echo  Opening it in your browser - no second copy started.
+    echo.
+    start "" "%URL%"
+    timeout /t 3 /nobreak >nul
+    exit /b 0
+)
+
 echo.
 echo  ==============================================================
 echo   DXF  -  3D Terrain Viewer   (setup + run)
@@ -56,15 +75,17 @@ REM 4. Start the app
 REM ---------------------------------------------------------------
 echo.
 echo  ==============================================================
-echo   Starting... your browser will open in a few seconds.
-echo   Address: http://localhost:8501
+echo   Starting... your browser opens as soon as the app is ready.
+echo   Address: %URL%
 echo   To stop the app: close this window or press Ctrl+C.
 echo  ==============================================================
 echo.
 
-start "" /b cmd /c "timeout /t 6 /nobreak >nul & start "" http://localhost:8501"
+REM Open the browser once, the moment the server starts answering
+REM (fixed wait times either opened too early or opened twice).
+start "" /b "%PS%" -NoProfile -WindowStyle Hidden -Command "for($i=0;$i -lt 240;$i++){$c=New-Object Net.Sockets.TcpClient;try{$c.Connect('127.0.0.1',%PORT%);$c.Dispose();Start-Process '%URL%';break}catch{Start-Sleep -Milliseconds 500}}"
 
-".venv\Scripts\python.exe" -m streamlit run app.py --server.port=8501 --server.headless=true --browser.gatherUsageStats=false
+".venv\Scripts\python.exe" -m streamlit run app.py --server.port=%PORT% --server.headless=true
 pause
 exit /b 0
 
